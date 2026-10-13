@@ -9,6 +9,12 @@ args = parser.parse_args()
 root = Path(args.checkout).resolve()
 file = root / "app/dispatcher/default.go"
 text = file.read_text(encoding="utf-8")
+stats_text = (root / "app/dispatcher/stats.go").read_text(encoding="utf-8")
+if any(marker not in text for marker in (
+    "ob.OriginalTarget = destination", "ob.RouteTarget = destination",
+    "d.routedDispatch(ctx, outbound, destination)",
+)) or any(marker not in stats_text for marker in ("type SizeStatWriter struct", "stats.Counter")):
+    raise SystemExit("Unsupported Xray source: destination or native counter contract changed; no files modified")
 anchor = "\thandler.Dispatch(ctx, link)"
 replacement = "\tctx = rasadWrap(ctx, link, destination)\n" + anchor
 if replacement not in text:

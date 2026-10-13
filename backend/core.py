@@ -14,6 +14,30 @@ from urllib import request, parse, error
 
 DEFAULTS = {"scope": "selected", "interval": 60, "retention": 7, "domains_enabled": False}
 
+UNKNOWN_DESTINATION_SQL = "(instr(domain,'__unknown_')=1 OR instr(domain,'__overflow_')=1)"
+DESTINATION_TOTALS_SQL = f"""COALESCE(SUM(up),0) measured_up,COALESCE(SUM(down),0) measured_down,
+    COALESCE(SUM(n),0) connections,COUNT(*) records,
+    COALESCE(SUM(CASE WHEN {UNKNOWN_DESTINATION_SQL} THEN up ELSE 0 END),0) unknown_up,
+    COALESCE(SUM(CASE WHEN {UNKNOWN_DESTINATION_SQL} THEN down ELSE 0 END),0) unknown_down,
+    COUNT(DISTINCT CASE WHEN NOT {UNKNOWN_DESTINATION_SQL} THEN domain END) supported_domains"""
+
+
+def destination_summary(row, config_bytes=0):
+    values = dict(row) if row is not None else {}
+    summary = {key: int(values.get(key) or 0) for key in
+               ("measured_up", "measured_down", "connections", "unknown_up", "unknown_down", "supported_domains")}
+    summary["measured_bytes"] = summary["measured_up"] + summary["measured_down"]
+    summary["unknown_bytes"] = summary["unknown_up"] + summary["unknown_down"]
+    summary["supported_up"] = summary["measured_up"] - summary["unknown_up"]
+    summary["supported_down"] = summary["measured_down"] - summary["unknown_down"]
+    summary["supported_bytes"] = summary["supported_up"] + summary["supported_down"]
+    summary["attribution_ratio"] = summary["supported_bytes"] / summary["measured_bytes"] if summary["measured_bytes"] else None
+    summary["config_bytes"] = int(config_bytes)
+    # These sources have different byte bases; this comparison is not coverage.
+    summary["counter_ratio"] = summary["measured_bytes"] / config_bytes if config_bytes else None
+    summary["has_measurements"] = bool(values.get("records"))
+    return summary
+
 
 class SameOriginRedirect(request.HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):
@@ -189,6 +213,14 @@ class Store:
     def log(self, action, target="server"):
         self.db.execute("INSERT INTO audit(ts,action,target) VALUES(?,?,?)", (int(time.time()), action, target))
 
+    def invalidate_metrics(self, email=None):
+        cursor = self.meta("metrics_cursor")
+        if cursor:
+            for field in ("rows", "first_seen", "last_seen"):
+                cursor[field] = {key: value for key, value in cursor.get(field, {}).items()
+                                 if email is not None and json.loads(key)[0] != email}
+            self.put("metrics_cursor", cursor)
+
     def bucket(self, ts):
         return int(dt.datetime.fromtimestamp(ts, self.tz).replace(minute=0, second=0, microsecond=0).timestamp())
 
@@ -242,6 +274,7 @@ class Store:
                 self.db.execute("UPDATE traffic SET email=? WHERE email=?", (archive, email))
                 self.db.execute("DELETE FROM domains WHERE email=?", (email,))
                 self.db.execute("DELETE FROM measured WHERE email=?", (email,))
+                self.invalidate_metrics(email)
                 self.db.execute("""UPDATE users SET consent=0,selected=0,consent_at=NULL,
                     generation=?,up=NULL,down=NULL,ts=NULL WHERE email=?""", (secrets.randbits(62) + 1, email))
                 self.log("user_removed_and_erased", email)
@@ -268,6 +301,7 @@ class Store:
             if not enabled:
                 self.db.execute("DELETE FROM domains WHERE email=?", (email,))
                 self.db.execute("DELETE FROM measured WHERE email=?", (email,))
+            self.invalidate_metrics(email)
             self.log("monitor_on" if enabled else "monitor_off_and_erased", email)
 
     def settings(self, data):
@@ -282,6 +316,10 @@ class Store:
                 # Store this at the administrative transition, not at a poll:
                 # the log reader may never observe a short off/on interval.
                 self.put("domains_resumed_at", time.time())
+                # Old cumulative rows must not cross an administrative pause.
+                # New generations only count freshly instrumented connections.
+                self.db.execute("UPDATE users SET generation=? WHERE consent=1 AND present=1", (secrets.randbits(62) + 1,))
+                self.invalidate_metrics()
             self.put("settings", s)
             self.log("settings_saved")
         self.prune()
@@ -293,6 +331,7 @@ class Store:
             if not enabled:
                 self.db.execute("DELETE FROM domains")
                 self.db.execute("DELETE FROM measured")
+            self.invalidate_metrics()
             self.log("monitor_all_current_on" if enabled else "monitor_all_off_and_erased")
 
     def add_domains(self, events):
@@ -330,28 +369,57 @@ class Store:
         with self.lock:
             users = [dict(x) for x in self.db.execute("SELECT * FROM users WHERE present=1 ORDER BY email")]
             totals = {r["email"]: dict(r) for r in self.db.execute("SELECT email,SUM(up) up,SUM(down) down FROM traffic WHERE bucket>=? AND bucket<? GROUP BY email", (start, end))}
+            per_user_destinations = {r["email"]: dict(r) for r in self.db.execute("SELECT email," + DESTINATION_TOTALS_SQL + " FROM measured WHERE bucket>=? AND bucket<? GROUP BY email", (start, end))}
             allowed = self.selected()
             for u in users:
                 value = totals.get(u["email"], {"up": 0, "down": 0})
-                u.update({"period_up": value["up"], "period_down": value["down"], "monitored": u["email"] in allowed})
+                u.update({"period_up": value["up"], "period_down": value["down"], "monitored": u["email"] in allowed,
+                          "destination_summary": destination_summary(per_user_destinations.get(u["email"]), value["up"] + value["down"])})
             where, args = "bucket>=? AND bucket<?", [start, end]
             if email:
                 where += " AND email=?"
                 args.append(email)
-            domains = [dict(r) for r in self.db.execute("SELECT domain,SUM(n) connections,MAX(last) last FROM domains WHERE " + where + " GROUP BY domain ORDER BY connections DESC LIMIT 100", args)]
             measures = [dict(r) for r in self.db.execute("SELECT domain,SUM(up) up,SUM(down) down,SUM(n) connections,MAX(last) last FROM measured WHERE " + where + " GROUP BY domain", args)]
-            merged = {d["domain"]: dict(d, bytes=None, source="access_log") for d in domains}
+            # Three separate collections prevent unknown traffic or log-only
+            # connection counts from consuming the measured website limit.
+            unmeasured = [dict(r, up=None, down=None, bytes=None, source="access_log") for r in self.db.execute(
+                "SELECT domain,SUM(n) connections,MAX(last) last FROM domains WHERE " + where +
+                " AND NOT EXISTS (SELECT 1 FROM measured m WHERE m.domain=domains.domain AND " + where +
+                ") GROUP BY domain ORDER BY connections DESC LIMIT 100", args + args)]
+            known, unknown = [], []
             for row in measures:
-                merged[row["domain"]] = dict(row, bytes=row["up"] + row["down"], source="dispatcher_counter")
-            domains = sorted(merged.values(), key=lambda d: d["connections"], reverse=True)[:100]
+                item = dict(row, bytes=row["up"] + row["down"], source="dispatcher_counter",
+                            unknown=row["domain"].startswith(("__unknown_", "__overflow_")))
+                (unknown if item["unknown"] else known).append(item)
+            domains = sorted(known, key=lambda d: (d["bytes"], d["connections"]), reverse=True)[:100]
+            unknown = sorted(unknown, key=lambda d: (d["bytes"], d["connections"]), reverse=True)
             series = [dict(r) for r in self.db.execute("SELECT bucket,SUM(up) up,SUM(down) down FROM traffic WHERE " + where + " GROUP BY bucket ORDER BY bucket", args)]
+            summary = destination_summary(self.db.execute("SELECT " + DESTINATION_TOTALS_SQL + " FROM measured WHERE " + where, args).fetchone(), sum(r["up"] + r["down"] for r in series))
+            destination_series = []
+            for row in self.db.execute("SELECT bucket," + DESTINATION_TOTALS_SQL + " FROM measured WHERE " + where + " GROUP BY bucket ORDER BY bucket", args):
+                item = destination_summary(row)
+                destination_series.append({"bucket": row["bucket"], "up": item["measured_up"], "down": item["measured_down"],
+                    "bytes": item["measured_bytes"], "supported_bytes": item["supported_bytes"], "unknown_bytes": item["unknown_bytes"]})
+            info = self.meta("metrics_info") or {}
+            last_snapshot = (self.meta("metrics_seen") or self.meta("metrics_cursor") or {}).get("ts")
+            snapshot_age = max(0, time.time() - last_snapshot) if last_snapshot is not None else None
+            metrics_status = self.meta("metrics_status") or "unavailable"
+            if metrics_status == "ready" and snapshot_age is not None and snapshot_age > max(120, self.meta("settings")["interval"] * 2):
+                metrics_status = "stale"
+            module = {"status": metrics_status, "connected": metrics_status == "ready", "last_snapshot": last_snapshot,
+                "snapshot_age": snapshot_age, "enabled": self.meta("settings")["domains_enabled"],
+                "dropped_flows": info.get("dropped_flows", 0), "rows": info.get("rows", 0),
+                "started_at": info.get("started_at"), "byte_basis": "dispatcher_payload",
+                "first_snapshot_is_baseline": info.get("first_snapshot_is_baseline", True),
+                "baseline_skipped_bytes": info.get("baseline_skipped_bytes", 0), "counter_resets": info.get("counter_resets", 0)}
             return {"mode": "live", "users": users, "domains": domains, "series": series,
+                    "unknown_destinations": unknown, "unmeasured_destinations": unmeasured,
+                    "destination_summary": summary, "destination_series": destination_series, "module": module,
                     "start": start, "end": end, "period": period, "settings": self.meta("settings"),
                     "last_sync": self.meta("last_sync"), "started": self.meta("started"),
                     "error": self.meta("error"), "collector": self.meta("collector") or {},
                     "log_status": self.meta("log_status") or "disabled", "timezone": str(self.tz),
-                    "metrics_status": self.meta("metrics_status") or "unavailable",
-                    "metrics_info": self.meta("metrics_info") or {},
+                    "metrics_status": metrics_status, "metrics_info": info,
                     "audit": [dict(r) for r in self.db.execute("SELECT * FROM audit ORDER BY id DESC LIMIT 60")]}
 
 
@@ -473,8 +541,9 @@ class Collector(threading.Thread):
 
 
 class Metrics:
-    """Read bounded cumulative snapshots from the optional dispatcher module.
-    A process change begins a new baseline; never replay pre-install counters.
+    """Read bounded cumulative snapshots from the dispatcher module.
+    A matching generation and a known process start allow complete first-sample
+    accounting. Legacy snapshots without a start time use a safe baseline.
     """
     def __init__(self, path, policy, store):
         self.path, self.policy, self.store = path, policy, store
@@ -513,52 +582,143 @@ class Metrics:
             if data.get("version") != 1 or not isinstance(data.get("rows"), list) or len(data["rows"]) > 8192:
                 return "invalid"
             ts = int(data["ts"])
-            if abs(time.time() - ts) > max(120, self.store.meta("settings")["interval"] * 2):
-                return "stale"
+            boot = data["boot"]
+            if not isinstance(boot, str) or not boot or len(boot) > 128:
+                return "invalid"
+            started_at = data.get("started_at")
+            if started_at is not None:
+                started_at = int(started_at)
+                if not 0 < started_at <= ts:
+                    return "invalid"
+            dropped = int(data.get("dropped_flows", 0))
+            if dropped < 0:
+                return "invalid"
             previous = self.store.meta("metrics_cursor") or {}
             current = {}
+            first_seen = {}
+            seen_keys = set()
             allowed = self.store.selected()
-            consent = {r[0]: r[1] for r in self.store.db.execute("SELECT email,generation FROM users WHERE consent=1")}
+            consent = {r["email"]: dict(r) for r in self.store.db.execute("SELECT email,generation,consent_at FROM users WHERE consent=1 AND present=1")}
             for row in data["rows"]:
-                email, domain = str(row["email"]), str(row["domain"])
+                email, domain = row["email"], row["domain"]
                 generation = int(row["generation"])
-                if len(domain) > 253 or len(email) > 320:
+                if not isinstance(email, str) or not isinstance(domain, str) or not email or not domain or len(domain) > 253 or len(email) > 320:
                     return "invalid"
                 key = json.dumps([email, domain, generation])
-                if key in current:
+                if key in seen_keys:
                     return "invalid"
+                seen_keys.add(key)
                 u, d, n = int(row["up"]), int(row["down"]), int(row["connections"])
-                if min(u, d, n) < 0:
+                if min(u, d, n) < 0 or max(u, d, n) >= 2**63:
                     return "invalid"
-                current[key] = [u, d, n]
+                first_ts = row.get("first_ts")
+                if first_ts is not None:
+                    first_ts = int(first_ts)
+                    if not (started_at or 1) <= first_ts <= ts:
+                        return "invalid"
+                # Rejected users/generations never leave private domains in the
+                # persistent cursor, including snapshots after revocation.
+                if email in consent and generation == consent[email]["generation"]:
+                    current[key] = [u, d, n]
+                    if first_ts is not None:
+                        first_seen[key] = first_ts
             # Validate all records before a single transaction can persist any.
             with self.store.db:
-                if previous.get("boot") == data["boot"] and ts > previous.get("ts", ts):
-                    for key, counters in current.items():
-                        email, domain, _ = json.loads(key)
-                        if email not in allowed or json.loads(key)[2] != consent.get(email):
+                same_process = previous.get("boot") == boot
+                if same_process and ts < previous.get("ts", ts):
+                    return "stale"  # never move a cumulative cursor backwards
+                self.store.put("metrics_seen", {"boot": boot, "ts": ts})
+                if abs(time.time() - ts) > max(120, self.store.meta("settings")["interval"] * 2):
+                    return "stale"
+                info = self.store.meta("metrics_info") or {}
+                skipped = int(info.get("baseline_skipped_bytes", 0))
+                resets = int(info.get("counter_resets", 0))
+                if same_process and ts == previous.get("ts"):
+                    return "ready"  # rereading a snapshot cannot add bytes
+                previous_rows = previous.get("rows", {}) if same_process else {}
+                previous_first = previous.get("first_seen", {}) if same_process else {}
+                previous_last = previous.get("last_seen", {}) if same_process else {}
+                for key, counters in current.items():
+                    email, domain, _ = json.loads(key)
+                    if email not in allowed:
+                        continue
+                    old = previous_rows.get(key)
+                    row_restarted = old is not None and (any(a < b for a, b in zip(counters, old)) or
+                        key in first_seen and key in previous_first and first_seen[key] != previous_first[key])
+                    if row_restarted:
+                        resets += 1
+                    if old is not None and not row_restarted:
+                        delta = [a - b for a, b in zip(counters, old)]
+                        start = previous_last.get(key, previous["ts"])
+                    elif started_at is not None:
+                        delta = counters[:]
+                        start = max(started_at, first_seen.get(key, started_at), consent[email]["consent_at"] or started_at)
+                        if same_process and previous.get("evicted") and old is None and first_seen.get(key, ts) < previous["ts"]:
+                            # A resurfacing row whose cursor was evicted cannot
+                            # safely replay its complete cumulative history.
+                            skipped += counters[0] + counters[1]
                             continue
-                        old = previous.get("rows", {}).get(key, [0, 0, 0])
-                        du, dd, dn = [max(0, a - b) for a, b in zip(counters, old)]
-                        if du or dd or dn:
-                            cursor = previous["ts"]
-                            remaining = [du, dd, dn]
-                            while cursor < ts:
-                                bucket = self.store.bucket(cursor)
-                                stop = min(ts, bucket + 3600)
-                                fraction = (stop-cursor)/(ts-previous["ts"])
-                                piece = remaining[:] if stop == ts else [min(left,int(v*fraction)) for left,v in zip(remaining,[du,dd,dn])]
-                                self.store.db.execute("""INSERT INTO measured VALUES(?,?,?,?,?,?,?)
-                                ON CONFLICT(email,bucket,domain) DO UPDATE SET up=up+excluded.up,
-                                down=down+excluded.down,n=n+excluded.n,last=MAX(last,excluded.last)""",
-                                (email,bucket,domain,*piece,ts))
-                                remaining = [left-value for left,value in zip(remaining,piece)]
-                                cursor = stop
-                self.store.put("metrics_cursor", {"boot": data["boot"], "ts": ts, "rows": current})
-                self.store.put("metrics_info", {"dropped_flows": data.get("dropped_flows", 0), "rows": len(current),
-                    "byte_basis": "dispatcher_payload", "first_snapshot_is_baseline": True})
+                    elif same_process and old is None:
+                        delta = counters[:]
+                        start = previous["ts"]
+                    else:
+                        skipped += counters[0] + counters[1]
+                        continue
+                    if start > ts:
+                        skipped += delta[0] + delta[1]
+                        continue
+                    if not any(delta):
+                        continue
+                    # A long-lost cursor cannot recover historical placement
+                    # from one cumulative total. Do not fabricate old periods.
+                    if start < time.time() - self.store.meta("settings")["retention"] * 86400:
+                        skipped += delta[0] + delta[1]
+                        continue
+                    self.add(email, domain, start, ts, delta)
+                # Retain omitted rows so a partial snapshot cannot make an
+                # existing cumulative total look like a new zero-based row.
+                retained = {key: value for key, value in previous_rows.items()
+                    if json.loads(key)[0] in consent and json.loads(key)[2] == consent[json.loads(key)[0]]["generation"]}
+                retained.update(current)
+                retained_first = {key: value for key, value in previous_first.items() if key in retained}
+                retained_first.update(first_seen)
+                retained_last = {key: previous_last.get(key, previous.get("ts", ts)) for key in retained}
+                retained_last.update({key: ts for key in current})
+                # The producer and consumer both enforce a bounded cursor.
+                # Current rows take priority if an inconsistent producer omits
+                # many older records; this loss is exposed rather than hidden.
+                evictions = max(0, len(retained) - 8192)
+                if evictions:
+                    for key in [key for key in retained if key not in current][:evictions]:
+                        retained.pop(key, None)
+                        retained_first.pop(key, None)
+                        retained_last.pop(key, None)
+                self.store.put("metrics_cursor", {"boot": boot, "ts": ts, "rows": retained, "first_seen": retained_first, "last_seen": retained_last,
+                    "evicted": bool(evictions or same_process and previous.get("evicted"))})
+                self.store.put("metrics_info", {"dropped_flows": dropped, "rows": len(current), "started_at": started_at,
+                    "byte_basis": "dispatcher_payload", "first_snapshot_is_baseline": started_at is None,
+                    "baseline_skipped_bytes": skipped, "counter_resets": resets,
+                    "cursor_evictions": int(info.get("cursor_evictions", 0)) + evictions})
             return "ready"
         except FileNotFoundError:
             return "unavailable"
-        except (OSError, ValueError, TypeError, KeyError):
+        except (OSError, ValueError, TypeError, KeyError, OverflowError):
             return "invalid"
+
+    def add(self, email, domain, start, end, counters):
+        cursor, remaining = start, counters[:]
+        while cursor < end:
+            bucket = self.store.bucket(cursor)
+            stop = min(end, bucket + 3600)
+            fraction = (stop - cursor) / (end - start)
+            piece = remaining[:] if stop == end else [min(left, int(value * fraction)) for left, value in zip(remaining, counters)]
+            self.store.db.execute("""INSERT INTO measured VALUES(?,?,?,?,?,?,?)
+                ON CONFLICT(email,bucket,domain) DO UPDATE SET up=up+excluded.up,
+                down=down+excluded.down,n=n+excluded.n,last=MAX(last,excluded.last)""", (email, bucket, domain, *piece, end))
+            remaining = [left - value for left, value in zip(remaining, piece)]
+            cursor = stop
+        if start >= end:
+            # An entire first flow may fit within the snapshot's second.
+            self.store.db.execute("""INSERT INTO measured VALUES(?,?,?,?,?,?,?)
+                ON CONFLICT(email,bucket,domain) DO UPDATE SET up=up+excluded.up,
+                down=down+excluded.down,n=n+excluded.n,last=MAX(last,excluded.last)""", (email, self.store.bucket(end), domain, *counters, end))

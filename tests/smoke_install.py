@@ -32,6 +32,10 @@ try:
     subprocess.run(['sudo','install','-d','-m','0750','/etc/rasad'],check=True)
     subprocess.run(['sudo','install','-m','0600',str(temp),'/etc/rasad/config.json'],check=True)
     subprocess.run(['sudo','bash','install.sh'],check=True)
+    # Plain dashboard installation must leave core byte metering disabled.
+    status=subprocess.check_output(['sudo','rasad','sites','status'],text=True)
+    assert 'disabled' in status
+    assert not Path('/etc/systemd/system/x-ui.service.d/90-rasad-sites.conf').exists()
     response=urlopen(Request('http://127.0.0.1:8787/api/login',data=json.dumps({'username':'admin','password':'ci fixture long password'}).encode(),headers={'Content-Type':'application/json','Origin':'http://localhost:8787'}))
     cookie=response.headers['Set-Cookie'].split(';')[0];response.close()
     for attempt in range(15):

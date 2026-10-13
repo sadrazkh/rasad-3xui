@@ -1,5 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
+RASAD_SITES=false
+case "${1:-}" in
+  '') [[ $# -eq 0 ]] || { echo 'Usage: sudo bash install.sh [--sites]'; exit 2; } ;;
+  --sites) [[ $# -eq 1 ]] || { echo 'Usage: sudo bash install.sh [--sites]'; exit 2; }; RASAD_SITES=true ;;
+  *) echo 'Usage: sudo bash install.sh [--sites]'; exit 2 ;;
+esac
 [[ $EUID -eq 0 ]] || { echo 'Run with sudo bash install.sh'; exit 1; }
 source /etc/os-release
 [[ "${ID:-}" == ubuntu || "${ID:-}" == debian ]] || { echo 'Ubuntu 22.04+ or Debian 12+ required'; exit 1; }
@@ -39,6 +45,7 @@ PY
 fi
 cp -a "$RASAD_SOURCE/backend/." /opt/rasad/backend/
 cp -a "$RASAD_SOURCE/dist/." /opt/rasad/dist/
+[[ ! -d "$RASAD_SOURCE/deploy" ]] || cp -a "$RASAD_SOURCE/deploy" /opt/rasad/
 [[ ! -d "$RASAD_SOURCE/xray-module" ]] || cp -a "$RASAD_SOURCE/xray-module" /opt/rasad/
 chown -R root:root /opt/rasad
 find /opt/rasad -type d -exec chmod 0755 {} +
@@ -71,7 +78,7 @@ RestartSec=5
 StateDirectory=rasad
 StateDirectoryMode=0700
 RuntimeDirectory=rasad
-RuntimeDirectoryMode=0750
+RuntimeDirectoryMode=02750
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
@@ -92,18 +99,24 @@ case "${1:-status}" in
   logs) journalctl -u rasad -n 100 --no-pager ;;
   restart) systemctl restart rasad ;;
   configure) ${EDITOR:-nano} /etc/rasad/config.json; systemctl restart rasad ;;
-  *) echo 'Usage: sudo rasad {status|logs|restart|configure}'; exit 1 ;;
+  sites) [[ $# -eq 2 ]] || { echo 'Usage: sudo rasad sites {enable|status|disable}'; exit 2; }; exec bash /opt/rasad/xray-module/enable.sh "$2" ;;
+  *) echo 'Usage: sudo rasad {status|logs|restart|configure|sites {enable|status|disable}}'; exit 1 ;;
 esac
 CLI
 chmod 0755 /usr/local/bin/rasad
 systemctl daemon-reload
 systemctl enable rasad >/dev/null
 systemctl restart rasad
+RASAD_PORT="$(python3 -c 'import json; print(int(json.load(open("/etc/rasad/config.json")).get("port", 8787)))')"
 for RASAD_ATTEMPT in {1..15}; do
-  if python3 -c 'from urllib.request import urlopen; urlopen("http://127.0.0.1:8787/api/health", timeout=1)' 2>/dev/null; then
-    echo 'Rasad installed. Listening on 127.0.0.1:8787.'
-    echo 'SSH tunnel: ssh -L 8787:127.0.0.1:8787 root@YOUR_SERVER'
-    echo 'Open http://localhost:8787 or configure Nginx with HTTPS. See README.'
+  if python3 -c 'import sys; from urllib.request import build_opener, ProxyHandler; build_opener(ProxyHandler({})).open("http://127.0.0.1:"+sys.argv[1]+"/api/health", timeout=1)' "$RASAD_PORT" 2>/dev/null; then
+    echo "Rasad installed. Listening on 127.0.0.1:$RASAD_PORT."
+    echo "SSH tunnel: ssh -L $RASAD_PORT:127.0.0.1:$RASAD_PORT root@YOUR_SERVER"
+    echo "Open http://localhost:$RASAD_PORT or configure Nginx with HTTPS. See README."
+    if $RASAD_SITES; then
+      echo 'Enabling destination byte counters: builds the current Xray release, then restarts native x-ui. Recovery: sudo rasad sites disable'
+      bash /opt/rasad/xray-module/enable.sh enable
+    fi
     exit 0
   fi
   sleep 1

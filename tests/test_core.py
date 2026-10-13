@@ -162,22 +162,23 @@ class AccountingTests(unittest.TestCase):
             self.assertEqual(self.store.db.execute("SELECT COUNT(*) FROM domains").fetchone()[0],2)
 
     def test_metrics_baseline_disable_restart_and_generation(self):
+        now=int(time.time())
         self.store.ingest([user()],set())
         self.store.settings(dict(DEFAULTS,domains_enabled=True))
-        self.store.set_user("alice",True)
+        with patch("core.time.time", return_value=now-60): self.store.set_user("alice",True)
         generation=self.store.db.execute("SELECT generation FROM users WHERE email='alice'").fetchone()[0]
         with tempfile.TemporaryDirectory(prefix=".rasad-test-", dir=Path(__file__).resolve().parents[1]) as directory:
             path=Path(directory)/"metrics.json";metrics=Metrics(str(path),str(Path(directory)/"policy.json"),self.store)
             def snapshot(up,down,ts,boot="one"):
                 path.write_text(json.dumps({"version":1,"boot":boot,"ts":ts,"rows":[{"email":"alice","domain":"example.com","generation":generation,"up":up,"down":down,"connections":up}]}))
-            now=int(time.time())
             snapshot(10,20,now-30);self.assertEqual(metrics.read(),"ready")
             snapshot(15,30,now-15);metrics.read()
             self.assertEqual(tuple(self.store.db.execute("SELECT SUM(up),SUM(down) FROM measured").fetchone()),(5,10))
             self.store.settings(dict(DEFAULTS,domains_enabled=False))
             snapshot(20,40,now-5);metrics.read()
             self.store.settings(dict(DEFAULTS,domains_enabled=True))
-            snapshot(21,41,now);metrics.read()
+            generation=self.store.db.execute("SELECT generation FROM users WHERE email='alice'").fetchone()[0]
+            snapshot(1,1,now);metrics.read()
             self.assertEqual(tuple(self.store.db.execute("SELECT SUM(up),SUM(down) FROM measured").fetchone()),(6,11))
             snapshot(100,200,now,boot="two");metrics.read()
             self.assertEqual(tuple(self.store.db.execute("SELECT SUM(up),SUM(down) FROM measured").fetchone()),(6,11))
@@ -186,6 +187,201 @@ class AccountingTests(unittest.TestCase):
             self.assertEqual(self.store.db.execute("SELECT COUNT(*) FROM measured").fetchone()[0],0)
             metrics.write_policy()
             self.assertEqual(json.loads((Path(directory)/"policy.json").read_text())["users"],{})
+
+    def test_destination_report_keeps_unknown_and_unlisted_bytes_in_totals(self):
+        now = int(time.time())
+        bucket = self.store.bucket(now)
+        self.store.ingest([user(), user(email="bob")], set())
+        self.store.db.execute("INSERT INTO traffic VALUES(?,?,?,?)", ("alice", bucket, 3000, 7000))
+        self.store.db.execute("INSERT INTO traffic VALUES(?,?,?,?)", ("bob", bucket, 1000, 2000))
+        self.store.db.executemany("INSERT INTO measured VALUES(?,?,?,?,?,?,?)",
+            [("alice", bucket, f"site-{i}.example", 1, 2, 1, now) for i in range(101)] +
+            [("alice", bucket, "__unknown_udp__", 500, 700, 2, now), ("bob", bucket, "bob.example", 3, 4, 1, now)])
+        self.store.db.execute("INSERT INTO domains VALUES(?,?,?,?,?)", ("alice", bucket, "access-only.example", 9999, now))
+        self.store.put("metrics_seen", {"boot": "one", "ts": now})
+        self.store.put("metrics_status", "ready")
+        self.store.put("metrics_info", {"dropped_flows": 2, "first_snapshot_is_baseline": False})
+        self.store.db.commit()
+        with patch.object(self.store, "bounds", return_value=(bucket, now + 60)):
+            report = self.store.report()
+            alice = self.store.report(email="alice")
+        summary = report["destination_summary"]
+        self.assertEqual(summary["measured_bytes"], 1510)
+        self.assertEqual((summary["supported_up"], summary["supported_down"], summary["supported_bytes"]), (104, 206, 310))
+        self.assertEqual((summary["unknown_up"], summary["unknown_down"], summary["unknown_bytes"]), (500, 700, 1200))
+        self.assertEqual(summary["supported_domains"], 102)
+        self.assertEqual(summary["connections"], 104)
+        self.assertAlmostEqual(summary["attribution_ratio"], 310 / 1510)
+        self.assertEqual(summary["config_bytes"], 13000)
+        self.assertEqual(len(report["domains"]), 100)
+        self.assertFalse(any(row["unknown"] for row in report["domains"]))
+        self.assertEqual(report["unknown_destinations"][0]["domain"], "__unknown_udp__")
+        self.assertEqual(report["unknown_destinations"][0]["bytes"], 1200)
+        self.assertEqual(report["unmeasured_destinations"][0]["domain"], "access-only.example")
+        self.assertEqual(report["destination_series"][0]["bytes"], 1510)
+        self.assertEqual(report["destination_series"][0]["supported_bytes"], 310)
+        self.assertEqual(alice["destination_summary"]["measured_bytes"], 1503)
+        self.assertNotIn("bob.example", [row["domain"] for row in alice["domains"]])
+        summaries = {row["email"]: row["destination_summary"] for row in report["users"]}
+        self.assertEqual(summaries["bob"]["measured_bytes"], 7)
+        self.assertEqual(summaries["alice"]["config_bytes"], 10000)
+        self.assertTrue(report["module"]["connected"])
+        self.assertEqual(report["module"]["last_snapshot"], now)
+        self.assertEqual(report["module"]["dropped_flows"], 2)
+        with patch.object(self.store, "bounds", return_value=(bucket, now + 60)), patch("core.time.time", return_value=now + 181):
+            self.assertEqual(self.store.report()["module"]["status"], "stale")
+
+    def test_access_log_fallback_does_not_fabricate_destination_bytes(self):
+        now = int(time.time())
+        bucket = self.store.bucket(now)
+        self.store.ingest([user()], set())
+        self.store.db.execute("INSERT INTO domains VALUES(?,?,?,?,?)", ("alice", bucket, "fallback.example", 5, now))
+        self.store.db.commit()
+        with patch.object(self.store, "bounds", return_value=(bucket, now + 60)):
+            report = self.store.report(email="alice")
+        self.assertEqual(report["domains"], [])
+        self.assertEqual(report["unmeasured_destinations"][0]["connections"], 5)
+        self.assertIsNone(report["unmeasured_destinations"][0]["bytes"])
+        self.assertIsNone(report["unmeasured_destinations"][0]["up"])
+        self.assertIsNone(report["unmeasured_destinations"][0]["down"])
+        self.assertFalse(report["destination_summary"]["has_measurements"])
+        self.assertIsNone(report["destination_summary"]["attribution_ratio"])
+        self.assertEqual(report["destination_series"], [])
+
+    def test_small_unknown_destination_survives_known_website_limit(self):
+        now = int(time.time())
+        bucket = self.store.bucket(now)
+        self.store.ingest([user()], set())
+        self.store.db.executemany("INSERT INTO measured VALUES(?,?,?,?,?,?,?)",
+            [("alice", bucket, f"site-{i}.example", 1000 + i, 2000 + i, 1, now) for i in range(101)] +
+            [("alice", bucket, "__unknown_udp__", 1, 2, 1, now), ("alice", bucket, "__unknown_tcp__", 2, 3, 1, now)])
+        self.store.db.execute("INSERT INTO domains VALUES(?,?,?,?,?)", ("alice", bucket, "site-100.example", 9000, now))
+        self.store.db.execute("INSERT INTO domains VALUES(?,?,?,?,?)", ("alice", bucket, "log-only.example", 5, now))
+        self.store.db.commit()
+        with patch.object(self.store, "bounds", return_value=(bucket, now + 60)):
+            report = self.store.report(email="alice")
+        self.assertEqual(len(report["domains"]), 100)
+        self.assertEqual(report["domains"][0]["domain"], "site-100.example")
+        self.assertEqual(report["domains"][-1]["domain"], "site-1.example")
+        self.assertEqual({row["domain"] for row in report["unknown_destinations"]}, {"__unknown_tcp__", "__unknown_udp__"})
+        self.assertEqual(sum(row["bytes"] for row in report["unknown_destinations"]), 8)
+        self.assertEqual(report["destination_summary"]["unknown_bytes"], 8)
+        self.assertEqual(report["destination_summary"]["supported_domains"], 101)
+        self.assertEqual([row["domain"] for row in report["unmeasured_destinations"]], ["log-only.example"])
+
+    def test_started_snapshot_counts_first_bytes_and_preserves_partial_cursor(self):
+        now = int(time.time())
+        with patch("core.time.time", return_value=now - 60):
+            self.store.ingest([user()], set())
+            self.store.settings(dict(DEFAULTS, domains_enabled=True))
+            self.store.set_user("alice", True)
+        generation = self.store.db.execute("SELECT generation FROM users WHERE email='alice'").fetchone()[0]
+        with tempfile.TemporaryDirectory(prefix=".rasad-test-", dir=Path(__file__).resolve().parents[1]) as directory:
+            path = Path(directory) / "metrics.json"
+            metrics = Metrics(str(path), "", self.store)
+            def snapshot(up, down, ts, boot="one", start=None, first=None, empty=False):
+                start = now - 50 if start is None else start
+                first = now - 40 if first is None else first
+                rows = [] if empty else [{"email": "alice", "domain": "example.com", "generation": generation,
+                    "up": up, "down": down, "connections": 1, "first_ts": first}]
+                path.write_text(json.dumps({"version": 1, "boot": boot, "started_at": start, "ts": ts, "rows": rows}))
+                return metrics.read()
+            def totals():
+                return tuple(self.store.db.execute("SELECT COALESCE(SUM(up),0),COALESCE(SUM(down),0) FROM measured").fetchone())
+            self.assertEqual(snapshot(10, 20, now - 30), "ready")
+            self.assertEqual(totals(), (10, 20))
+            self.assertFalse(self.store.meta("metrics_info")["first_snapshot_is_baseline"])
+            self.assertEqual(self.store.meta("metrics_info")["baseline_skipped_bytes"], 0)
+            snapshot(15, 30, now - 15)
+            snapshot(15, 30, now - 15)
+            self.assertEqual(totals(), (15, 30))
+            snapshot(0, 0, now - 10, empty=True)
+            snapshot(20, 40, now)
+            self.assertEqual(totals(), (20, 40))
+            self.assertEqual(snapshot(17, 34, now - 20), "stale")
+            snapshot(25, 50, now + 10)
+            self.assertEqual(totals(), (25, 50))
+            self.assertEqual(snapshot(2, 3, now + 15, first=now + 11), "ready")
+            self.assertEqual(totals(), (27, 53))
+            self.assertEqual(self.store.meta("metrics_info")["counter_resets"], 1)
+            snapshot(7, 9, now + 20, boot="two", start=now + 11, first=now + 12)
+            self.assertEqual(totals(), (34, 62))
+            self.store.set_user("alice", False)
+            self.assertEqual(self.store.meta("metrics_cursor")["rows"], {})
+            self.assertEqual(self.store.meta("metrics_cursor")["first_seen"], {})
+            snapshot(8, 10, now + 21, boot="two", start=now + 11, first=now + 12)
+            self.assertEqual(self.store.meta("metrics_cursor")["rows"], {})
+            self.assertNotIn("example.com", json.dumps(self.store.meta("metrics_cursor")))
+            self.assertEqual(totals(), (0, 0))
+
+    def test_global_resume_ignores_old_generation_and_counts_new_source_rows(self):
+        now = int(time.time())
+        with patch("core.time.time", return_value=now - 60):
+            self.store.ingest([user()], set())
+            self.store.settings(dict(DEFAULTS, domains_enabled=True))
+            self.store.set_user("alice", True)
+        generation = self.store.db.execute("SELECT generation FROM users WHERE email='alice'").fetchone()[0]
+        with tempfile.TemporaryDirectory(prefix=".rasad-test-", dir=Path(__file__).resolve().parents[1]) as directory:
+            path = Path(directory) / "metrics.json"
+            metrics = Metrics(str(path), "", self.store)
+            def sample(value, ts, selected_generation, first):
+                path.write_text(json.dumps({"version": 1, "boot": "one", "started_at": now - 50, "ts": ts,
+                    "rows": [{"email": "alice", "domain": "example.com", "generation": selected_generation,
+                              "first_ts": first, "up": value, "down": value, "connections": 1}]}))
+                return metrics.read()
+            sample(10, now - 30, generation, now - 40)
+            with patch("core.time.time", return_value=now - 20):
+                self.store.settings(dict(DEFAULTS, domains_enabled=False))
+            sample(20, now - 15, generation, now - 40)
+            with patch("core.time.time", return_value=now - 10):
+                self.store.settings(dict(DEFAULTS, domains_enabled=True))
+            resumed_generation = self.store.db.execute("SELECT generation FROM users WHERE email='alice'").fetchone()[0]
+            self.assertNotEqual(generation, resumed_generation)
+            sample(100, now - 5, generation, now - 40)
+            self.assertEqual(self.store.meta("metrics_cursor")["rows"], {})
+            sample(3, now, resumed_generation, now - 4)
+            self.assertEqual(tuple(self.store.db.execute("SELECT SUM(up),SUM(down) FROM measured").fetchone()), (13, 13))
+
+    def test_invalid_snapshot_cannot_partially_commit_measurements(self):
+        now = int(time.time())
+        with patch("core.time.time", return_value=now - 60):
+            self.store.ingest([user()], set())
+            self.store.settings(dict(DEFAULTS, domains_enabled=True))
+            self.store.set_user("alice", True)
+        generation = self.store.db.execute("SELECT generation FROM users WHERE email='alice'").fetchone()[0]
+        with tempfile.TemporaryDirectory(prefix=".rasad-test-", dir=Path(__file__).resolve().parents[1]) as directory:
+            path = Path(directory) / "metrics.json"
+            metrics = Metrics(str(path), "", self.store)
+            row = {"email": "alice", "domain": "example.com", "generation": generation, "first_ts": now - 40,
+                   "up": 10, "down": 20, "connections": 1}
+            snapshot = {"version": 1, "boot": "one", "started_at": now - 50, "ts": now - 30, "rows": [row]}
+            path.write_text(json.dumps(snapshot)); self.assertEqual(metrics.read(), "ready")
+            snapshot["ts"] = now
+            snapshot["rows"] = [dict(row, up=30), dict(row, domain="invalid.example", up=-1)]
+            path.write_text(json.dumps(snapshot)); self.assertEqual(metrics.read(), "invalid")
+            self.assertEqual(tuple(self.store.db.execute("SELECT SUM(up),SUM(down) FROM measured").fetchone()), (10, 20))
+            self.assertEqual(self.store.meta("metrics_cursor")["ts"], now - 30)
+
+    def test_partial_snapshot_uses_last_seen_time_across_midnight(self):
+        midnight = int(dt.datetime.now(self.store.tz).replace(hour=0, minute=0, second=0, microsecond=0).timestamp())
+        with patch("core.time.time", return_value=midnight - 120):
+            self.store.ingest([user()], set())
+            self.store.settings(dict(DEFAULTS, domains_enabled=True))
+            self.store.set_user("alice", True)
+        generation = self.store.db.execute("SELECT generation FROM users WHERE email='alice'").fetchone()[0]
+        with tempfile.TemporaryDirectory(prefix=".rasad-test-", dir=Path(__file__).resolve().parents[1]) as directory:
+            path = Path(directory) / "metrics.json"
+            metrics = Metrics(str(path), "", self.store)
+            def sample(up, down, ts, empty=False):
+                rows = [] if empty else [{"email": "alice", "domain": "example.com", "generation": generation,
+                    "up": up, "down": down, "connections": 1, "first_ts": midnight - 60}]
+                path.write_text(json.dumps({"version": 1, "boot": "one", "started_at": midnight - 120, "ts": ts, "rows": rows}))
+                with patch("core.time.time", return_value=ts): self.assertEqual(metrics.read(), "ready")
+            sample(10, 20, midnight - 30)
+            sample(0, 0, midnight + 1, empty=True)
+            sample(20, 40, midnight + 30)
+            rows = self.store.db.execute("SELECT bucket,up,down FROM measured ORDER BY bucket").fetchall()
+            self.assertEqual([tuple(row) for row in rows], [(midnight - 3600, 15, 30), (midnight, 5, 10)])
 
 
 if __name__ == "__main__": unittest.main()

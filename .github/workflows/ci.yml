@@ -12,8 +12,8 @@ jobs:
           python-version: '3.12'
       - run: python -m unittest discover -s tests -v
       - run: node --check dist/app.js
-      - run: node --test tests/test_ui_race.cjs
-      - run: bash -n install.sh xray-module/build.sh
+      - run: node --test tests/*.cjs
+      - run: bash -n install.sh xray-module/build.sh xray-module/enable.sh
       - run: python3 tests/smoke_install.py
   optional-xray:
     runs-on: ubuntu-latest
@@ -31,3 +31,4 @@ jobs:
       - run: go build -trimpath -o xray-rasad ./main
         working-directory: /tmp/xray-rasad
       - run: python3 tests/smoke_xray.py /tmp/xray-rasad/xray-rasad
+      - run: sudo python3 tests/smoke_sites_native.py /tmp/xray-rasad/xray-rasad
