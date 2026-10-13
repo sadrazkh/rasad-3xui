@@ -1,0 +1,17 @@
+{
+  "panel_url": "http://127.0.0.1:2053/YOUR_WEB_BASE_PATH",
+  "panel_token": "",
+  "panel_username": "",
+  "panel_password": "",
+  "admin_username": "admin",
+  "admin_password_hash": "GENERATED_BY_CONFIGURE_PY",
+  "public_origin": "http://localhost:8787",
+  "listen": "127.0.0.1",
+  "port": 8787,
+  "database": "/var/lib/rasad/rasad.db",
+  "timezone": "Asia/Tehran",
+  "access_log": "",
+  "log_timezone": "UTC",
+  "domain_metrics": "/run/rasad/domains.json",
+  "domain_policy": "/run/rasad/policy.json"
+}

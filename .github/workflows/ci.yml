@@ -1,0 +1,30 @@
+name: Validate dashboard and optional Xray module
+on: [push, pull_request, workflow_dispatch]
+permissions:
+  contents: read
+jobs:
+  dashboard:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m unittest discover -s tests -v
+      - run: node --check dist/app.js
+      - run: bash -n install.sh xray-module/build.sh
+  optional-xray:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.27.x'
+          cache: false
+      - run: git clone https://github.com/XTLS/Xray-core.git /tmp/xray-rasad
+      - run: git -C /tmp/xray-rasad checkout --detach c77a4d0e4932a53f3eeafafdfef877b56fd660ad
+      - run: python3 xray-module/apply.py /tmp/xray-rasad
+      - run: go test ./app/dispatcher -run Rasad -count=1
+        working-directory: /tmp/xray-rasad
+      - run: go build -trimpath -o xray-rasad ./main
+        working-directory: /tmp/xray-rasad
