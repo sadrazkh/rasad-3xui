@@ -148,7 +148,9 @@ def protocols(path):
         if not isinstance(inbound, dict):
             raise InstallError("The running config has an unsupported inbound shape")
         protocol = inbound.get("protocol")
-        if protocol == "dokodemo-door" and inbound.get("tag") == "api" and inbound.get("listen") in ("127.0.0.1", "::1"):
+        # Current 3x-ui uses Xray's tunnel alias for its loopback API listener.
+        # It has no per-user identity and is not a user traffic inbound.
+        if protocol in ("dokodemo-door", "tunnel") and inbound.get("tag") == "api" and inbound.get("listen") in ("127.0.0.1", "::1"):
             continue
         if protocol not in PROTOCOLS:
             raise InstallError(f"Unsupported user inbound protocol: {protocol!r}; no replacement made")

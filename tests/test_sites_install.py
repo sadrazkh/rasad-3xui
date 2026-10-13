@@ -46,6 +46,32 @@ class SitesFixtures(unittest.TestCase):
             with self.assertRaises(sites.InstallError):
                 sites.config_path(["xray", "-c", "a.json", "-c", "b.json"], Path("/srv"))
 
+    def test_loopback_api_accepts_current_tunnel_and_legacy_alias(self):
+        config = self.root / "api-alias.json"
+        user = {"protocol": "vless", "settings": {"clients": [{"email": "one"}]}}
+        for protocol in ("tunnel", "dokodemo-door"):
+            for address in ("127.0.0.1", "::1"):
+                with self.subTest(protocol=protocol, address=address):
+                    value = {"inbounds": [user, {"protocol": protocol, "tag": "api", "listen": address,
+                        "port": 62789, "settings": {"rewriteAddress": "127.0.0.1"}}]}
+                    config.write_text(json.dumps(value))
+                    original = config.read_bytes()
+                    self.assertEqual(sites.protocols(config), ["vless"])
+                    self.assertEqual(config.read_bytes(), original)
+                    self.assertEqual([row["protocol"] for row in sites.sniffing_summary(config)], ["vless"])
+
+    def test_tunnel_alias_is_not_accepted_for_user_or_exposed_api_inbounds(self):
+        config = self.root / "unsupported-tunnel.json"
+        user = {"protocol": "vless", "settings": {"clients": [{"email": "one"}]}}
+        for inbound in ({"protocol": "tunnel", "tag": "forwarder", "listen": "127.0.0.1"},
+                        {"protocol": "tunnel", "tag": "api", "listen": "0.0.0.0"},
+                        {"protocol": "tunnel", "tag": "api", "listen": "::"},
+                        {"protocol": "tunnel", "tag": "api"}):
+            with self.subTest(inbound=inbound):
+                config.write_text(json.dumps({"inbounds": [user, inbound]}))
+                with self.assertRaisesRegex(sites.InstallError, "Unsupported user inbound protocol"):
+                    sites.protocols(config)
+
     def test_sniffing_preflight_reports_missing_domains_without_changing_config(self):
         config = self.root / "sniffing.json"
         value = {"inbounds": [{"tag": "ready", "protocol": "vless", "sniffing": {"enabled": True, "destOverride": ["http", "tls"], "routeOnly": True}},

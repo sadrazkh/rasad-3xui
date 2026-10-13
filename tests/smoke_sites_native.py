@@ -56,7 +56,11 @@ try:
     shutil.copy2(sys.argv[1], binary)
     binary.chmod(0o755)
     config = fixture / "config.json"
-    config.write_text(json.dumps({"log": {"loglevel": "warning"}, "inbounds": [{"tag": "fixture-vless", "listen": "127.0.0.1", "port": 18745,
+    config.write_text(json.dumps({"log": {"loglevel": "warning"},
+        "api": {"tag": "api", "services": ["HandlerService", "StatsService"]},
+        "routing": {"rules": [{"type": "field", "inboundTag": ["api"], "outboundTag": "api"}]},
+        "inbounds": [{"tag": "api", "listen": "127.0.0.1", "port": 62789, "protocol": "tunnel", "settings": {"rewriteAddress": "127.0.0.1"}},
+        {"tag": "fixture-vless", "listen": "127.0.0.1", "port": 18745,
         "protocol": "vless", "settings": {"clients": [{"id": "95891b71-d3e3-4eaa-bf65-dbf29c202f1e", "email": "fixture-user"}], "decryption": "none"},
         "streamSettings": {"network": "tcp"}, "sniffing": {"enabled": True, "destOverride": ["http", "tls"], "routeOnly": True}}],
         "outbounds": [{"protocol": "freedom"}]}))
