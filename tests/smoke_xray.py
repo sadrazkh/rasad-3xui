@@ -23,11 +23,13 @@ uuid='550e8400-e29b-41d4-a716-446655440000'
 with tempfile.TemporaryDirectory(prefix='rasad-xray-smoke-') as directory:
     root=Path(directory);policy=root/'policy.json';metrics=root/'domains.json'
     policy.write_text(json.dumps({'enabled':True,'expires':int(time.time())+300,'users':{'smoke-user':123}}))
-    server={'log':{'loglevel':'debug'},'inbounds':[{'listen':'127.0.0.1','port':15500,'protocol':'vless','settings':{'clients':[{'id':uuid,'email':'smoke-user'}],'decryption':'none'}}],'outbounds':[{'protocol':'freedom','settings':{'redirect':'127.0.0.1:15502','finalRules':[{'action':'allow','network':'tcp','ip':['127.0.0.1/32'],'port':['15502']}]}}]}
+    server={'log':{'loglevel':'debug'},'inbounds':[{'listen':'127.0.0.1','port':15500,'protocol':'vless','settings':{'clients':[{'id':uuid,'email':'smoke-user'}],'decryption':'none'}}],'outbounds':[{'protocol':'freedom','settings':{'redirect':'127.0.0.1:15502','finalRules':[{'action':'allow','network':'tcp','ip':['127.0.0.1/32'],'port':15502}]}}]}
     client={'log':{'loglevel':'error'},'inbounds':[{'listen':'127.0.0.1','port':15501,'protocol':'http','settings':{}}],'outbounds':[{'protocol':'vless','settings':{'vnext':[{'address':'127.0.0.1','port':15500,'users':[{'id':uuid,'encryption':'none'}]}]}}]}
     (root/'server.json').write_text(json.dumps(server));(root/'client.json').write_text(json.dumps(client))
     env=dict(os.environ,RASAD_POLICY=str(policy),RASAD_METRICS=str(metrics))
     running=[]
+    for file in ('server.json','client.json'):
+        subprocess.run([binary,'run','-test','-config',str(root/file)],check=True)
     def request_payload():
         with socket.create_connection(('127.0.0.1',15501),timeout=5) as conn:
             conn.sendall(b'GET http://localhost:15502/payload HTTP/1.1\r\nHost: localhost:15502\r\nConnection: close\r\n\r\n')
