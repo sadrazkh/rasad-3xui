@@ -36,7 +36,10 @@ with tempfile.TemporaryDirectory(prefix='rasad-xray-smoke-') as directory:
                 part=conn.recv(65536)
                 if not part:break
                 response+=part
-            assert payload in response,'proxy path failed to deliver expected payload'
+                # HTTP proxy transports may remain open after a complete response.
+                if b'\r\n\r\n' in response and len(response.split(b'\r\n\r\n',1)[1])>=len(payload):
+                    break
+            assert response.split(b'\r\n\r\n',1)[1]==payload,'proxy path failed to deliver expected payload'
     try:
         running.append(subprocess.Popen([binary,'run','-config',str(root/'server.json')],env=env))
         running.append(subprocess.Popen([binary,'run','-config',str(root/'client.json')],env={k:v for k,v in os.environ.items() if k not in ('RASAD_POLICY','RASAD_METRICS')}))
