@@ -17,6 +17,7 @@ import (
     "github.com/xtls/xray-core/common/buf"
     "github.com/xtls/xray-core/common/net"
     "github.com/xtls/xray-core/common/session"
+    "github.com/xtls/xray-core/features/stats"
     "github.com/xtls/xray-core/transport"
 )
 
@@ -133,15 +134,24 @@ func (r *rasadReader) ReadMultiBuffer() (buf.MultiBuffer,error) {
 func (r *rasadReader) Interrupt() { common.Interrupt(r.Reader) }
 func (r *rasadReader) Close() error { return common.Close(r.Reader) }
 
-type rasadWriter struct { buf.Writer; row *rasadRow; hub *rasadHub }
-func (w *rasadWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
-    // Count payload passed through dispatch, matching Xray's SizeStatWriter
-    // basis. These are not physical-link bytes or confirmed delivered bytes.
-    if w.hub.active(w.row) { w.row.down.Add(int64(mb.Len())) }
-    return w.Writer.WriteMultiBuffer(mb)
+// Keep the native SizeStatWriter type so Xray's zero-copy splice path can
+// update the destination counter without disabling splice or missing bytes.
+type rasadDownCounter struct { upstream stats.Counter; row *rasadRow; hub *rasadHub }
+func (c *rasadDownCounter) Add(value int64) int64 {
+    old := c.row.down.Load()
+    if value>0 && c.hub.active(c.row) { old=c.row.down.Add(value)-value }
+    if c.upstream!=nil { return c.upstream.Add(value) }
+    return old
 }
-func (w *rasadWriter) Interrupt() { common.Interrupt(w.Writer) }
-func (w *rasadWriter) Close() error { return common.Close(w.Writer) }
+func (c *rasadDownCounter) Value() int64 {
+    if c.upstream!=nil { return c.upstream.Value() }
+    return c.row.down.Load()
+}
+func (c *rasadDownCounter) Set(value int64) int64 {
+    // Resetting the panel's user counter must not reset independent telemetry.
+    if c.upstream!=nil { return c.upstream.Set(value) }
+    return c.row.down.Load()
+}
 
 type rasadContextKey struct{}
 func rasadWrap(ctx context.Context,link *transport.Link,destination net.Destination) context.Context {
@@ -168,6 +178,10 @@ func rasadWrap(ctx context.Context,link *transport.Link,destination net.Destinat
     if row==nil { return ctx }
     row.connections.Add(1)
     link.Reader=&rasadReader{link.Reader,row,h}
-    link.Writer=&rasadWriter{link.Writer,row,h}
+    if native,ok := link.Writer.(*SizeStatWriter); ok {
+        link.Writer=&SizeStatWriter{Counter:&rasadDownCounter{native.Counter,row,h},Writer:native.Writer}
+    } else {
+        link.Writer=&SizeStatWriter{Counter:&rasadDownCounter{nil,row,h},Writer:link.Writer}
+    }
     return context.WithValue(ctx,rasadContextKey{},true)
 }
