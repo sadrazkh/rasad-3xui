@@ -1,13 +1,43 @@
 import json
+import io
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 import sys
 import threading
 import unittest
+from unittest.mock import patch
 from urllib import request,error
 from http.server import ThreadingHTTPServer
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]/"backend"))
 from server import App, handler_for, password_hash
 from core import Store
+
+
+class LoginLimitTests(unittest.TestCase):
+    def test_parallel_login_attempts_share_one_budget(self):
+        store = Store(":memory:")
+        self.addCleanup(store.db.close)
+        app = App({"admin_username": "admin", "admin_password_hash": "unused", "public_origin": "http://localhost"}, store)
+        Handler = handler_for(app)
+        hashing = threading.Barrier(8)
+        def wrong_password(*_):
+            hashing.wait(timeout=5)
+            return False
+        def attempt(_):
+            body = b'{"username":"admin","password":"wrong"}'
+            handler = Handler.__new__(Handler)
+            handler.path = "/api/login"
+            handler.client_address = ("127.0.0.1", 1234)
+            handler.headers = {"Origin": "http://localhost", "Content-Length": str(len(body))}
+            handler.rfile = io.BytesIO(body)
+            statuses = []
+            handler.respond = lambda status, *args, **kwargs: statuses.append(status)
+            handler.do_POST()
+            return statuses[0]
+        with patch("server.password_ok", side_effect=wrong_password), ThreadPoolExecutor(max_workers=8) as pool:
+            self.assertEqual(list(pool.map(attempt, range(8))), [401] * 8)
+            self.assertEqual(list(pool.map(attempt, range(8))), [429] * 8)
+        self.assertEqual(app.failures["127.0.0.1"][0], 8)
 
 
 class HttpTests(unittest.TestCase):

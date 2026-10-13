@@ -214,12 +214,15 @@ class Store:
     def ingest(self, users, online, now=None):
         now = int(time.time() if now is None else now)
         with self.lock, self.db:
+            # Remember the actual prior presence before resetting this snapshot.
+            # A removed email may later be assigned to a different person.
+            previously_present = {r[0] for r in self.db.execute("SELECT email FROM users WHERE present=1")}
             self.db.execute("UPDATE users SET present=0")
             for user in users:
                 email = user["email"]
                 previous = self.db.execute("SELECT * FROM users WHERE email=?", (email,)).fetchone()
                 up, down = user["up"], user["down"]
-                if previous and previous["ts"] < now and None not in (up, down, previous["up"], previous["down"]):
+                if previous and previous["ts"] is not None and previous["ts"] < now and None not in (up, down, previous["up"], previous["down"]):
                     if up >= previous["up"] and down >= previous["down"]:
                         self.add_delta(email, previous["ts"], now, up - previous["up"], down - previous["down"])
                         if now - previous["ts"] > self.meta("settings")["interval"] * 3:
@@ -232,6 +235,16 @@ class Store:
                   VALUES(?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(email) DO UPDATE SET name=excluded.name,
                   inbound=excluded.inbound,protocol=excluded.protocol,enabled=excluded.enabled,online=excluded.online,
                   up=excluded.up,down=excluded.down,total=excluded.total,expiry=excluded.expiry,present=1,ts=excluded.ts""", values)
+            for email in previously_present - {user["email"] for user in users}:
+                # Keep server-wide history under an internal identity that a
+                # real email cannot share, while erasing private destinations.
+                archive = "\x00archived:" + secrets.token_hex(16)
+                self.db.execute("UPDATE traffic SET email=? WHERE email=?", (archive, email))
+                self.db.execute("DELETE FROM domains WHERE email=?", (email,))
+                self.db.execute("DELETE FROM measured WHERE email=?", (email,))
+                self.db.execute("""UPDATE users SET consent=0,selected=0,consent_at=NULL,
+                    generation=?,up=NULL,down=NULL,ts=NULL WHERE email=?""", (secrets.randbits(62) + 1, email))
+                self.log("user_removed_and_erased", email)
             if self.meta("started") is None:
                 self.put("started", now)
             self.put("last_sync", now)
@@ -262,6 +275,13 @@ class Store:
         if s["scope"] not in ("selected", "all") or s["interval"] not in (60, 120, 300) or s["retention"] not in (3, 7, 14, 30) or type(s["domains_enabled"]) is not bool:
             raise ValueError("invalid_settings")
         with self.lock, self.db:
+            previous = self.meta("settings")
+            if previous["domains_enabled"] and not s["domains_enabled"]:
+                self.put("domains_paused_at", time.time())
+            elif not previous["domains_enabled"] and s["domains_enabled"] and self.meta("domains_paused_at") is not None:
+                # Store this at the administrative transition, not at a poll:
+                # the log reader may never observe a short off/on interval.
+                self.put("domains_resumed_at", time.time())
             self.put("settings", s)
             self.log("settings_saved")
         self.prune()
@@ -366,13 +386,14 @@ class Tail:
 
     def read(self):
         allowed = self.store.selected()
+        resumed_at = self.store.meta("domains_resumed_at") or 0
         # Only persist lines newer than the latest user activation. Even when the
         # reader has a backlog, activating a user never imports their earlier use.
         for email in allowed - self.active_since.keys():
             self.active_since[email] = int(time.time())
         for row in self.store.db.execute("SELECT email,consent_at FROM users WHERE consent=1"):
             if row["email"] in self.active_since:
-                self.active_since[row["email"]] = max(self.active_since[row["email"]], row["consent_at"] or 0)
+                self.active_since[row["email"]] = max(self.active_since[row["email"]], row["consent_at"] or 0, resumed_at)
         self.active_since = {k: v for k, v in self.active_since.items() if k in allowed}
         if not self.path or not allowed:
             self.identity = None

@@ -30,7 +30,8 @@ const esc = value => String(value ?? '').replace(/[&<>"']/g,c=>({'&':'&amp;','<'
 const num = n => new Intl.NumberFormat('fa-IR').format(n);
 function bytes(value){if(value===null || value===undefined)return '—';const units=['B','KB','MB','GB','TB'];let n=Math.max(0,value),i=0;while(n>=1024 && i<4){n/=1024;i++;}return `${n.toLocaleString('en-US',{maximumFractionDigits:i?1:0})} ${units[i]}`;}
 const timeText = t => t? new Date(t*1000).toLocaleTimeString('fa-IR',{hour:'2-digit',minute:'2-digit',timeZone:'Asia/Tehran'}):'—';
-const state={mode:null,view:'overview',period:'today',query:'',filter:'all',page:1,user:null,csrf:'',report:null,busy:false};
+const state={mode:null,view:'overview',period:'today',query:'',filter:'all',page:1,user:null,csrf:'',report:null,reportSelection:null,busy:false};
+let loadVersion=0,loadEpoch=0,loadPromise=null;
 const periodNames={today:'امروز',yesterday:'دیروز',week:'۷ روز اخیر',month:'۳۰ روز اخیر'};
 const viewNames={overview:'نمای کلی',users:'کاربران',domains:'تحلیل مقصدها',monitor:'مدیریت ثبت دامنه',reports:'گزارش‌ها',settings:'تنظیمات',audit:'رویدادها',detail:'گزارش کاربر'};
 const demoNames=['علی رضایی','سارا احمدی','محمد کریمی','نیلوفر حسینی','آرمان مرادی','مریم محمدی','رضا موسوی','پریسا نوری','امیر صالحی','نگار صادقی','حامد عباسی','رها کاظمی'];
@@ -53,18 +54,38 @@ function demoReport(){
 }
 function toast(message){$('#toast').textContent=message;$('#toast').classList.add('show');clearTimeout(toast.timer);toast.timer=setTimeout(()=>$('#toast').classList.remove('show'),3500);}
 async function api(path,data){
+ const requestEpoch=loadEpoch;
  const opts={credentials:'same-origin',headers:{}};
  if(data!==undefined){opts.method='POST';opts.headers={'Content-Type':'application/json','X-CSRF-Token':state.csrf};opts.body=JSON.stringify(data);}
  const response=await fetch('/api/'+path,opts);
- if(response.status===401){if(path!=='login')loginScreen();throw new Error(path==='login'?'نام کاربری یا رمز عبور درست نیست.':'برای ادامه وارد شوید.');}
+ if(response.status===401){if(path!=='login'&&requestEpoch===loadEpoch)loginScreen();throw new Error(path==='login'?'نام کاربری یا رمز عبور درست نیست.':'برای ادامه وارد شوید.');}
  if(!response.ok)throw new Error(response.status===429?'تلاش‌های زیاد؛ پنج دقیقه دیگر دوباره امتحان کنید.':'درخواست انجام نشد. اتصال و تنظیمات را بررسی کنید.');
  return response.json();
 }
-async function load(){
- if(state.busy)return;state.busy=true;
- try{state.report=state.mode==='demo'?demoReport():await api(`report?period=${state.period}${state.user?'&email='+encodeURIComponent(state.user):''}`);render();}
- catch(e){toast(e.message);if(!state.report&&state.mode==='live'&&!$('.login'))$('#app').innerHTML=`<div class="login"><div class="card"><h1>اتصال برقرار نشد</h1><p>سرویس رصد در دسترس نیست. داده‌های واقعی هنوز دریافت نشده‌اند.</p><button class="btn primary" data-action="refresh">تلاش دوباره</button></div></div>`;}
- finally{state.busy=false;}
+function reportKey(period=state.period,user=state.user){return JSON.stringify([period,user]);}
+function load(){
+ if(state.reportSelection!==reportKey()){state.report=null;state.reportSelection=null;}
+ loadVersion++;
+ if(state.busy)return loadPromise;
+ state.busy=true;
+ loadPromise=Promise.resolve().then(async()=>{
+  let version;
+  try{
+   do{
+    version=loadVersion;
+    const period=state.period,user=state.user,epoch=loadEpoch;
+    const current=()=>version===loadVersion&&period===state.period&&user===state.user&&epoch===loadEpoch;
+    try{
+     const report=state.mode==='demo'?demoReport():await api(`report?period=${period}${user?'&email='+encodeURIComponent(user):''}`);
+     if(!current())continue;
+     state.report=report;state.reportSelection=reportKey(period,user);render();
+    }
+    catch(e){if(!current())continue;toast(e.message);if(!state.report&&state.mode==='live'&&!$('.login'))$('#app').innerHTML=`<div class="login"><div class="card"><h1>اتصال برقرار نشد</h1><p>سرویس رصد در دسترس نیست. داده‌های واقعی هنوز دریافت نشده‌اند.</p><button class="btn primary" data-action="refresh">تلاش دوباره</button></div></div>`;}
+   }while(version!==loadVersion);
+  }
+  finally{state.busy=false;loadPromise=null;}
+ });
+ return loadPromise;
 }
 function audit(action,target='server'){demoPrefs.audit.unshift({id:Date.now(),ts:Math.floor(Date.now()/1000),action,target});demoPrefs.audit=demoPrefs.audit.slice(0,60);demoSave();}
 async function mutate(path,data){if(state.mode==='live')return api(path,data);if(path==='settings'){demoPrefs.settings=data;audit('settings_saved');}if(path==='monitor'){const i=demoEmails.indexOf(data.email);demoPrefs.enabled=demoPrefs.enabled.filter(x=>x!==i);if(data.enabled)demoPrefs.enabled.push(i);audit(data.enabled?'monitor_on':'monitor_off_and_erased',data.email);}if(path==='monitor-all'){demoPrefs.enabled=data.enabled?demoEmails.map((_,i)=>i):[];audit(data.enabled?'monitor_all_current_on':'monitor_all_off_and_erased');}demoSave();}
@@ -140,8 +161,10 @@ function confirmMonitoring(email,enabled){
 function help(){modal('رصد چطور کار می‌کند؟',`<p><strong>مصرف کاربران:</strong> اختلاف شمارنده‌های دانلود و آپلود 3x-ui ذخیره می‌شود. قبل از شروع جمع‌آوری، آمار روزانه در دسترس نیست.</p><p><strong>گزارش مقصد:</strong> access.log، نام مقصد و تعداد اتصال را می‌دهد؛ حجم هر سایت را ندارد. DNS هم حجم را مشخص نمی‌کند. ماژول اختیاری شمارندهٔ مقصد به Xray سفارشی نیاز دارد.</p><p><strong>دقت:</strong> اتصال می‌تواند پس‌زمینه، CDN یا برنامه باشد. ECH، IP و تونل دیگر می‌توانند مقصد را نامشخص کنند. زمان‌بندی مصرف نزدیک مرز ساعت بر اساس فاصلهٔ نمونه‌برداری تخمین زده می‌شود.</p><p><strong>نصب Ubuntu:</strong> راهنمای ریپو شامل نصب‌کننده، سرویس systemd، تنظیم اتصال و Nginx است. ابتدا مصرف کلی فعال می‌شود؛ ثبت دامنه را از پنل انتخاب کنید.</p><p><strong>هزینه:</strong> درخواست‌ها به پنل روی لوپ‌بک و پردازش لاگ محلی انجام می‌شوند. صفر بودن مصرف CPU و دیسک تضمین نمی‌شود.</p>`,button('متوجه شدم','close-modal','check',true));}
 function download(content,type,name){const url=URL.createObjectURL(new Blob([content],{type}));const a=document.createElement('a');a.href=url;a.download=name;a.click();setTimeout(()=>URL.revokeObjectURL(url),1000);toast('گزارش دریافت شد.');}
 function csvCell(v){let text=String(v??'');if(/^[=+\-@\t\r]/.test(text))text="'"+text;return '"'+text.replaceAll('"','""')+'"';}
-function exportCsv(domains=false){const r=state.report;const headings=domains?['domain','connections','last_seen_utc','measured_bytes']:['email','name','period','upload_bytes','download_bytes','config_upload_bytes','config_download_bytes','quota_bytes','domain_monitoring'];let users=r.users.filter(u=>(!state.user||u.email===state.user)&&(u.name+' '+u.email).toLowerCase().includes(state.query.toLowerCase())&&(state.filter==='all'||state.filter==='online'&&u.online||state.filter==='monitored'&&u.monitored));const rows=domains?r.domains.map(d=>[d.domain,d.connections,new Date(d.last*1000).toISOString(),d.bytes]):users.map(u=>[u.email,u.name,state.period,u.period_up,u.period_down,u.up,u.down,u.total,u.monitored]);download('\uFEFF'+[headings,...rows].map(row=>row.map(csvCell).join(',')).join('\r\n'),'text/csv;charset=utf-8',`rasad-${domains?'domains':'users'}-${state.period}-${state.mode}.csv`);}
-function loginScreen(){$('#app').innerHTML=`<div class="login"><form class="card" id="login-form"><img src="/logo.svg" alt="رصد"><h1>به رصد وارد شوید</h1><p>مرکز مدیریت مصرف و گزارش کاربران 3x-ui</p><div class="field"><label for="username">نام کاربری</label><input id="username" autocomplete="username" required dir="ltr"></div><div class="field"><label for="password">رمز عبور</label><input id="password" type="password" autocomplete="current-password" required></div><button type="submit" class="btn primary">${icon('lock')}ورود به داشبورد</button></form></div>`;}
+function reportReady(){if(state.report&&state.reportSelection===reportKey())return true;toast('در حال دریافت گزارش انتخاب‌شده؛ کمی صبر کنید.');return false;}
+function exportCsv(domains=false){if(!reportReady())return;const r=state.report;const headings=domains?['domain','connections','last_seen_utc','measured_bytes']:['email','name','period','upload_bytes','download_bytes','config_upload_bytes','config_download_bytes','quota_bytes','domain_monitoring'];let users=r.users.filter(u=>(!state.user||u.email===state.user)&&(u.name+' '+u.email).toLowerCase().includes(state.query.toLowerCase())&&(state.filter==='all'||state.filter==='online'&&u.online||state.filter==='monitored'&&u.monitored));const rows=domains?r.domains.map(d=>[d.domain,d.connections,new Date(d.last*1000).toISOString(),d.bytes]):users.map(u=>[u.email,u.name,state.period,u.period_up,u.period_down,u.up,u.down,u.total,u.monitored]);download('\uFEFF'+[headings,...rows].map(row=>row.map(csvCell).join(',')).join('\r\n'),'text/csv;charset=utf-8',`rasad-${domains?'domains':'users'}-${state.period}-${state.mode}.csv`);}
+function exportJson(){if(!reportReady())return;download(JSON.stringify(state.report,null,2),'application/json',`rasad-report-${state.period}-${state.mode}.json`);}
+function loginScreen(){loadEpoch++;state.report=null;state.reportSelection=null;state.csrf='';$('#app').innerHTML=`<div class="login"><form class="card" id="login-form"><img src="/logo.svg" alt="رصد"><h1>به رصد وارد شوید</h1><p>مرکز مدیریت مصرف و گزارش کاربران 3x-ui</p><div class="field"><label for="username">نام کاربری</label><input id="username" autocomplete="username" required dir="ltr"></div><div class="field"><label for="password">رمز عبور</label><input id="password" type="password" autocomplete="current-password" required></div><button type="submit" class="btn primary">${icon('lock')}ورود به داشبورد</button></form></div>`;}
 document.addEventListener('click',async e=>{
  const b=e.target.closest('button,a.brand');if(!b)return;
  if(b.matches('a.brand')){e.preventDefault();navigate('overview');return;}
@@ -156,12 +179,12 @@ document.addEventListener('click',async e=>{
  if(action==='theme'){document.body.classList.toggle('dark');localStorage.setItem('rasad-theme',document.body.classList.contains('dark')?'dark':'light');}
  if(action==='menu')$('.sidebar').classList.toggle('open');
  if(action==='close-modal')closeModal();
- if(action==='monitor-user'){const u=state.report.users.find(u=>u.email===b.dataset.email);confirmMonitoring(u.email,!(u.selected&&u.consent));}
- if(action==='bulk-on'||action==='bulk-off')confirmMonitoring(null,action==='bulk-on');
+ if(action==='monitor-user'){if(!reportReady())return;const u=state.report.users.find(u=>u.email===b.dataset.email);if(!u){toast('کاربر در گزارش تازه پیدا نشد.');return;}confirmMonitoring(u.email,!(u.selected&&u.consent));}
+ if(action==='bulk-on'||action==='bulk-off'){if(!reportReady())return;confirmMonitoring(null,action==='bulk-on');}
  if(action==='setting-switch')b.setAttribute('aria-checked',b.getAttribute('aria-checked')==='true'?'false':'true');
  if(action==='export-users')exportCsv();
  if(action==='export-domains')exportCsv(true);
- if(action==='export-json')download(JSON.stringify(state.report,null,2),'application/json',`rasad-report-${state.period}-${state.mode}.json`);
+ if(action==='export-json')exportJson();
  if(action==='logout'){try{await api('logout',{});state.report=null;state.csrf='';loginScreen();}catch(err){toast(err.message);}}
 });
 document.addEventListener('input',e=>{if(e.target.id==='user-search'){const cursor=e.target.selectionStart;state.query=e.target.value;state.page=1;render();const field=$('#user-search');field.focus();field.setSelectionRange(cursor,cursor);}});

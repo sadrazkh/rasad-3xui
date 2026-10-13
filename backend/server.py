@@ -128,20 +128,23 @@ def handler_for(app):
                     return
                 data = self.json_body()
                 if path == "/api/login":
+                    username, password = data.get("username", ""), data.get("password", "")
+                    if not isinstance(username, str) or not isinstance(password, str) or len(password) > 512:
+                        raise ValueError("invalid_body")
                     ip = self.client_address[0]
                     with app.lock:
                         app.failures = {k: v for k, v in app.failures.items() if v[1] > time.time()}
                         failures, until = app.failures.get(ip, (0, time.time() + 300))
-                    if failures >= 8:
+                        limited = failures >= 8
+                        if not limited:
+                            # Reserve the attempt before the expensive hash;
+                            # concurrent requests must share the same budget.
+                            app.failures[ip] = (failures + 1, until)
+                    if limited:
                         self.respond(429, {"error": "too_many_attempts"})
                         return
-                    username, password = data.get("username", ""), data.get("password", "")
-                    if not isinstance(username, str) or not isinstance(password, str) or len(password) > 512:
-                        raise ValueError("invalid_body")
                     valid_password = password_ok(password, app.config["admin_password_hash"])
                     if not hmac.compare_digest(username.encode(), app.config["admin_username"].encode()) or not valid_password:
-                        with app.lock:
-                            app.failures[ip] = (failures + 1, until)
                         self.respond(401, {"error": "invalid_credentials"})
                         return
                     token, csrf = secrets.token_urlsafe(32), secrets.token_urlsafe(24)

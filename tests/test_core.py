@@ -5,6 +5,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest.mock import patch
 from zoneinfo import ZoneInfo
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "backend"))
 from core import Store, normalize, parse_access, Tail, Metrics, DEFAULTS
@@ -66,6 +67,56 @@ class AccountingTests(unittest.TestCase):
         self.assertEqual(self.store.selected(), {"alice","bob"})
         self.store.ingest([user(),user(email="bob"),user(email="new")], set())
         self.assertNotIn("new", self.store.selected())
+
+    def test_removed_email_does_not_inherit_consent_or_history(self):
+        self.store.ingest([user()], set(), 100000)
+        self.store.settings(dict(DEFAULTS, domains_enabled=True))
+        self.store.set_user("alice", True)
+        generation = self.store.db.execute("SELECT generation FROM users WHERE email='alice'").fetchone()[0]
+        self.store.ingest([user(150, 280)], set(), 100060)
+        self.store.add_domains([("alice", "previous-person.example", int(time.time()))])
+        self.store.db.execute("INSERT INTO measured VALUES(?,?,?,?,?,?,?)", ("alice", self.store.bucket(time.time()), "previous-person.example", 5, 10, 1, int(time.time())))
+        self.store.db.commit()
+        self.store.ingest([], set(), 100120)
+        self.assertEqual(self.store.selected(), set())
+        self.assertEqual(self.store.db.execute("SELECT COUNT(*) FROM domains").fetchone()[0], 0)
+        self.assertEqual(self.store.db.execute("SELECT COUNT(*) FROM measured").fetchone()[0], 0)
+        archived = self.store.db.execute("SELECT email FROM traffic").fetchone()[0]
+        self.assertTrue(archived.startswith("\x00archived:"))
+        self.store.ingest([user(1000, 2000)], set(), 100180)
+        replacement = self.store.db.execute("SELECT * FROM users WHERE email='alice'").fetchone()
+        self.assertEqual((replacement["consent"], replacement["selected"]), (0, 0))
+        self.assertNotEqual(replacement["generation"], generation)
+        self.assertEqual(self.store.db.execute("SELECT COUNT(*) FROM traffic WHERE email='alice'").fetchone()[0], 0)
+        self.assertEqual(tuple(self.store.db.execute("SELECT SUM(up),SUM(down) FROM traffic").fetchone()), (50, 80))
+        self.store.ingest([user(1020, 2050)], set(), 100240)
+        self.assertEqual(tuple(self.store.db.execute("SELECT SUM(up),SUM(down) FROM traffic WHERE email='alice'").fetchone()), (20, 50))
+        self.assertEqual(tuple(self.store.db.execute("SELECT SUM(up),SUM(down) FROM traffic").fetchone()), (70, 130))
+
+    def test_master_switch_off_on_between_polls_skips_disabled_log_lines(self):
+        initial = int(time.time()) - 120
+        with tempfile.TemporaryDirectory(prefix=".rasad-test-", dir=Path(__file__).resolve().parents[1]) as directory:
+            path = Path(directory) / "access.log"
+            path.write_text("")
+            def line(domain, ts):
+                stamp = dt.datetime.fromtimestamp(ts, dt.timezone.utc).strftime("%Y/%m/%d %H:%M:%S")
+                return stamp + f" from 1.2.3.4:123 accepted tcp:{domain}:443 [in -> out] email: alice\n"
+            with patch("core.time.time", return_value=initial):
+                self.store.ingest([user()], set())
+                self.store.settings(dict(DEFAULTS, domains_enabled=True))
+                self.store.set_user("alice", True)
+                tail = Tail(str(path), self.store)
+                tail.read()
+            with patch("core.time.time", return_value=initial + 5):
+                self.store.settings(dict(DEFAULTS, domains_enabled=False))
+            path.write_text(line("during-off.example", initial + 10) + line("same-second-before-on.example", initial + 20))
+            with patch("core.time.time", return_value=initial + 20.5):
+                self.store.settings(dict(DEFAULTS, domains_enabled=True))
+            with path.open("a") as file:
+                file.write(line("after-on.example", initial + 21))
+            with patch("core.time.time", return_value=initial + 30):
+                tail.read()
+            self.assertEqual([r[0] for r in self.store.db.execute("SELECT domain FROM domains")], ["after-on.example"])
 
     def test_retention_and_invalid_settings(self):
         self.store.add_delta("alice", 1, 60, 1, 1)

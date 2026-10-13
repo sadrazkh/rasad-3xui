@@ -22,7 +22,7 @@ if [[ ! -f "$RASAD_SOURCE/backend/server.py" ]]; then
 fi
 [[ -f "$RASAD_SOURCE/backend/server.py" && -f "$RASAD_SOURCE/dist/index.html" ]] || { echo 'Invalid source bundle'; exit 1; }
 apt-get update -qq
-apt-get install -y -qq python3 tzdata acl ca-certificates
+apt-get install -y -qq python3 tzdata acl ca-certificates nano
 python3 -c 'import sys; assert sys.version_info >= (3,10), "Python 3.10+ required"'
 id rasad >/dev/null 2>&1 || useradd --system --home-dir /var/lib/rasad --shell /usr/sbin/nologin rasad
 install -d -m 0755 /opt/rasad /opt/rasad/backend /opt/rasad/dist
